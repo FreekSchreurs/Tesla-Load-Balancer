@@ -1,0 +1,793 @@
+# =======================================================================================
+# ESPHome configuratie: HomeWizard P1 → Tesla Load Balancer → Tesla Wall Connector 3
+# =======================================================================================
+#
+# DOEL:
+#   - Zoek de HomeWizard P1 meter automatisch via mDNS in het lokale netwerk
+#   - Haal per-fase vermogen/stroom op via de lokale HomeWizard API (GET /api/v1/data)
+#   - Emuleer een Neurio/Tesla Energy Device over RS485/Modbus
+#   - De Tesla Wall Connector Gen 3 polt deze Modbus-slave en regelt de laadstroom
+#     automatisch op basis van het beschikbare vermogen
+#
+# HARDWARE:
+#   - ESP32-S3-N16R8 (bijv. als onderdeel van een devkit of custom PCB)
+#   - RS485 transceiver met automatische richting-sturing
+#     (bijv. Gangda Tong / MAX485 met interne CD4069 inverter).
+#     Geen aparte DE/RE-pin nodig.
+#   - Aansluiting: ESP32 TX → RS485 TXD, ESP32 RX → RS485 RXD
+#   - RS485 A/B naar Tesla Wall Connector RS485 aansluitklemmen
+#     (wissel A/B indien de Modbus-communicatie niet werkt)
+#
+# PINOUT:
+#   RS485 TX      : GPIO17  → RS485 TXD
+#   RS485 RX      : GPIO18  ← RS485 RXD
+#   RS485 VCC     : 3.3V of 5V (zie module specificatie)
+#   RS485 GND     : GND
+#
+# ARCHITECTUUR:
+#   mDNS-discovery draait NIET in een aparte FreeRTOS-task maar direct in het
+#   poll-interval. De mdns_query_ptr() call blokkeert de main-loop maximaal
+#   800ms. Dit is acceptabel: ESPHome's Modbus-slave is interrupt-driven via
+#   de UART hardware FIFO en mist geen Modbus-frames tijdens deze pauze.
+#   Discovery wordt beperkt via last_mdns_attempt (max 1x per mdns_retry_interval_s).
+#
+# REGISTERMAP (o.b.v. reverse engineering LucaTNT/Klangen82):
+#
+#   IDENTIFICATIE (vaste strings, gevraagd bij initialisatie):
+#     0x0001–0x000A : Serienummer / MAC-adres (ASCII, 10 words)
+#     0x000B–0x0010 : Firmwareversie "1.6.1-Tesla" (6 words)
+#     0x0011–0x0014 : Gereserveerd (0xFFFF, 4 words)
+#     0x0015–0x001B : Hardware-versie "012.00020A.H" (7 words)
+#     0x001C        : Gereserveerd (0xFFFF)
+#     0x001D–0x001F : Meternummer "90954" (3 words)
+#     0x0020–0x0026 : Modelnummer "VAH4810AB0231" (7 words)
+#     0x0027–0x002E : Gereserveerd (0xFFFF, 8 words)
+#     0x002F–0x0037 : MAC-adres "04:71:4B:05:68:61" (9 words)
+#
+#   MEETDATA (gevraagd elke seconde tijdens normaal bedrijf):
+#     0x0088–0x0089 : CT1 actief vermogen (W) – float32
+#     0x008A–0x008B : CT2 actief vermogen (W) – float32
+#     0x008C–0x008D : CT3 actief vermogen (W) – float32
+#     0x008E–0x008F : CT4 actief vermogen (W) – float32 (altijd 0)
+#     0x0090–0x0091 : Totaal actief vermogen (W) – float32
+#     0x0092        : Gereserveerd (0x0000)
+#     0x00F4–0x00F5 : CT1 stroom (A) – float32
+#     0x00F6–0x00F7 : CT2 stroom (A) – float32
+#     0x00F8–0x00F9 : CT3 stroom (A) – float32
+#     0x00FA–0x00FB : CT4 stroom (A) – float32 (altijd 0)
+#     0x00FC–0x00FD : Totaal stroom (A) – float32
+#
+#   INIT HANDSHAKE (gevraagd bij herkenning):
+#     0x9C42        : 0x0001
+#     0x9C43–0x9C46 : "Generac" (ASCII, 4 words)
+#
+# =============================================================================
+
+substitutions:
+  device_name: "tesla-load-balancer"
+  friendly_name: "Tesla Load Balancer"
+
+  # UART-pinnen voor RS485
+  rs485_tx_pin: "GPIO17"
+  rs485_rx_pin: "GPIO18"
+  
+  # Wachttijd (seconden) tussen mDNS-discovery pogingen als IP onbekend is
+  mdns_retry_interval_s: "10"
+
+  # Aantal netfasen (1, 2 of 3)
+  grid_phases: "3"
+
+  # Nominale netspanning per fase in Volt (NL = 230V)
+  
+  grid_voltage: "230"
+
+  # Poll-interval in seconden voor de P1 meter HTTP-API
+  poll_interval_s: "1"
+
+  # Maximaal aantal opeenvolgende HTTP-fouten voordat de ESP32 herstart
+  max_http_fails: "30"
+
+  # Maximale leeftijd (ms) van P1-data voordat Modbus-registers op 0 gaan
+  stale_data_timeout_ms: "5000"
+
+  # Extra wachttijd (ms) voor safe_reboot() na max_http_fails fouten
+  reboot_backoff_ms: "60000"
+
+# --- ESP32-S3 platformconfiguratie -------------------------------------------
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.1.0
+  includes:
+    - <mdns.h>
+  platformio_options:
+    board_build.flash_mode: qio
+    build_flags:
+      - -DBOARD_HAS_PSRAM
+      - -mfix-esp32-psram-cache-issue
+    board_build.arduino.memory_type: qio_opi
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: 5.5.2
+    sdkconfig_options:
+      CONFIG_ESP32S3_SPIRAM_SUPPORT: "y"
+      CONFIG_SPIRAM_MODE_OCT: "y"
+      CONFIG_SPIRAM_SPEED_80M: "y"
+      CONFIG_SPIRAM_BOOT_INIT: "y"
+      CONFIG_ESPTOOLPY_FLASHMODE_OPI: "y"
+      CONFIG_ESPTOOLPY_FLASHSIZE_16MB: "y"
+      CONFIG_ESPTOOLPY_FLASHMODE: "opi"
+
+psram:
+  mode: octal
+  enable_ecc: true
+
+# --- Logging ------------------------------------------------------------------
+logger:
+  level: INFO
+
+# --- WiFi ---------------------------------------------------------------------
+wifi:
+  ap:
+    ssid: ${friendly_name}
+    ap_timeout: 0s
+#  ssid: !secret wifi_ssid
+#  password: !secret wifi_password
+
+captive_portal:
+
+# --- Home Assistant API -------------------------------------------------------
+api:
+  reboot_timeout: 0s
+#  encryption:
+#    key: !secret api_encryption_key
+
+
+# --- Over-the-air updates -----------------------------------------------------
+ota:
+  - platform: esphome
+#    password: !secret ota_password
+    password: ""
+
+# --- UART voor RS485/Modbus ---------------------------------------------------
+uart:
+  - id: wallconn_uart
+    # RS485 TX pin
+    tx_pin: ${rs485_tx_pin}
+    # RS485 RX pin
+    rx_pin: ${rs485_rx_pin}
+    # Baud rate used by Tesla Wall Connector protocol
+    baud_rate: 115200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    # For Waveshare ESP32-S3-RS485-CAN
+    #flow_control_pin: 21
+
+# --- Modbus server (slave) ----------------------------------------------------
+modbus:
+  - id: wallconn_modbus
+    # Bind Modbus to RS485 UART
+    uart_id: wallconn_uart
+    # Act as Modbus server (Tesla reads from this device)
+    # Flowcontrol
+    role: server
+    # Delay between Modbus frames
+    send_wait_time: 20ms
+
+ 
+# =============================================================================
+# MODBUS SERVER REGISTERS – Neurio/Tesla Energy Device emulatie
+# =============================================================================
+modbus_controller:
+  - id: load_balancer
+    modbus_id: wallconn_modbus
+    address: 0x1
+    
+    # Respond to any unknown register reads to avoid Wall Connector errors
+    server_courtesy_response:
+      enabled: true
+      register_last_address: 0xFFFF
+      register_value: 0    
+    
+    server_registers:
+      # --- IDENTIFICATIE: Serienummer (ASCII) – 0x0001–0x000A ---------------
+      - { address: 0x01, value_type: U_WORD, read_lambda: 'return 0x3078;' }
+      - { address: 0x02, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 0x03, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 0x04, value_type: U_WORD, read_lambda: 'return 0x3034;' }
+      - { address: 0x05, value_type: U_WORD, read_lambda: 'return 0x3731;' }
+      - { address: 0x06, value_type: U_WORD, read_lambda: 'return 0x3442;' }
+      - { address: 0x07, value_type: U_WORD, read_lambda: 'return 0x3035;' }
+      - { address: 0x08, value_type: U_WORD, read_lambda: 'return 0x3638;' }
+      - { address: 0x09, value_type: U_WORD, read_lambda: 'return 0x3631;' }
+      - { address: 0x0A, value_type: U_WORD, read_lambda: 'return 0x0000;' }
+
+      # --- IDENTIFICATIE: Firmwareversie "1.6.1-Tesla" – 0x000B–0x0010 -----
+      - { address: 0x0B, value_type: U_WORD, read_lambda: 'return 0x312E;' }
+      - { address: 0x0C, value_type: U_WORD, read_lambda: 'return 0x362E;' }
+      - { address: 0x0D, value_type: U_WORD, read_lambda: 'return 0x312D;' }
+      - { address: 0x0E, value_type: U_WORD, read_lambda: 'return 0x5465;' }
+      - { address: 0x0F, value_type: U_WORD, read_lambda: 'return 0x736C;' }
+      - { address: 0x10, value_type: U_WORD, read_lambda: 'return 0x6100;' }
+
+      # --- IDENTIFICATIE: Gereserveerd (0xFFFF) – 0x0011–0x0014 ------------
+      - { address: 0x11, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x12, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x13, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x14, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+
+      # --- IDENTIFICATIE: Hardware-versie "012.00020A.H" – 0x0015–0x001B --
+      - { address: 0x15, value_type: U_WORD, read_lambda: 'return 0x3031;' }
+      - { address: 0x16, value_type: U_WORD, read_lambda: 'return 0x322E;' }
+      - { address: 0x17, value_type: U_WORD, read_lambda: 'return 0x3030;' }
+      - { address: 0x18, value_type: U_WORD, read_lambda: 'return 0x3032;' }
+      - { address: 0x19, value_type: U_WORD, read_lambda: 'return 0x3041;' }
+      - { address: 0x1A, value_type: U_WORD, read_lambda: 'return 0x2E48;' }
+      - { address: 0x1B, value_type: U_WORD, read_lambda: 'return 0x0000;' }
+
+      # --- IDENTIFICATIE: Gereserveerd – 0x001C ----------------------------
+      - { address: 0x1C, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+
+      # --- IDENTIFICATIE: Meternummer "90954" – 0x001D–0x001F --------------
+      - { address: 0x1D, value_type: U_WORD, read_lambda: 'return 0x3930;' }
+      - { address: 0x1E, value_type: U_WORD, read_lambda: 'return 0x3935;' }
+      - { address: 0x1F, value_type: U_WORD, read_lambda: 'return 0x3400;' }
+
+      # --- IDENTIFICATIE: Modelnummer "VAH4810AB0231" – 0x0020–0x0026 -----
+      - { address: 0x20, value_type: U_WORD, read_lambda: 'return 0x5641;' }
+      - { address: 0x21, value_type: U_WORD, read_lambda: 'return 0x4834;' }
+      - { address: 0x22, value_type: U_WORD, read_lambda: 'return 0x3831;' }
+      - { address: 0x23, value_type: U_WORD, read_lambda: 'return 0x3041;' }
+      - { address: 0x24, value_type: U_WORD, read_lambda: 'return 0x4230;' }
+      - { address: 0x25, value_type: U_WORD, read_lambda: 'return 0x3233;' }
+      - { address: 0x26, value_type: U_WORD, read_lambda: 'return 0x3100;' }
+
+      # --- IDENTIFICATIE: Gereserveerd (0xFFFF x8) – 0x0027–0x002E --------
+      - { address: 0x27, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x28, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x29, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x2A, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x2B, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x2C, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x2D, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+      - { address: 0x2E, value_type: U_WORD, read_lambda: 'return 0xFFFF;' }
+
+      # --- IDENTIFICATIE: MAC-adres "04:71:4B:05:68:61" – 0x002F–0x0037 --
+      - { address: 0x2F, value_type: U_WORD, read_lambda: 'return 0x3034;' }
+      - { address: 0x30, value_type: U_WORD, read_lambda: 'return 0x3A37;' }
+      - { address: 0x31, value_type: U_WORD, read_lambda: 'return 0x313A;' }
+      - { address: 0x32, value_type: U_WORD, read_lambda: 'return 0x3442;' }
+      - { address: 0x33, value_type: U_WORD, read_lambda: 'return 0x3A30;' }
+      - { address: 0x34, value_type: U_WORD, read_lambda: 'return 0x353A;' }
+      - { address: 0x35, value_type: U_WORD, read_lambda: 'return 0x3638;' }
+      - { address: 0x36, value_type: U_WORD, read_lambda: 'return 0x3A36;' }
+      - { address: 0x37, value_type: U_WORD, read_lambda: 'return 0x3100;' }
+
+      # Secondary identity block required by Wall Connector handshake
+      - { address: 0x9C42, value_type: U_WORD, read_lambda: 'return 0x0001;' }
+      - { address: 0x9C43, value_type: U_WORD, read_lambda: 'return 0x0042;' }
+      - { address: 0x9C44, value_type: U_WORD, read_lambda: 'return 0x4765;' }
+      - { address: 0x9C45, value_type: U_WORD, read_lambda: 'return 0x6E65;' }
+      - { address: 0x9C46, value_type: U_WORD, read_lambda: 'return 0x7261;' }
+      - { address: 0x9C47, value_type: U_WORD, read_lambda: 'return 0x6300;' }
+
+
+      # --- MEETDATA: Vermogen per fase (W) – FP32 --------------------------
+      # Stale-data: registers -> 0 als data ouder dan stale_data_timeout_ms
+      - address: 0x88  # CT1 / L1 actief vermogen (W)
+        value_type: FP32
+        read_lambda: |-
+          if (!id(p1_available) ||
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL)
+            return 0.0f;
+          return id(power_l1_w);
+
+      - address: 0x8A  # CT2 / L2 actief vermogen (W)
+        value_type: FP32
+        read_lambda: |-
+          if (!id(p1_available) ||
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL)
+            return 0.0f;
+          return (${grid_phases} >= 2) ? id(power_l2_w) : 0.0f;
+
+      - address: 0x8C  # CT3 / L3 actief vermogen (W)
+        value_type: FP32
+        read_lambda: |-
+          if (!id(p1_available) ||
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL)
+            return 0.0f;
+          return (${grid_phases} >= 3) ? id(power_l3_w) : 0.0f;
+
+      - address: 0x8E  # CT4 – altijd 0
+        value_type: FP32
+        read_lambda: 'return 0.0f;'
+
+      - address: 0x90  # Totaal actief vermogen (W)
+        value_type: FP32
+        read_lambda: |-
+          if (!id(p1_available) ||
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL)
+            return 0.0f;
+          return id(total_power_w);
+
+#      - address: 0x92  # Gereserveerd
+#        value_type: U_WORD
+#        read_lambda: 'return 0;'
+
+      # --- MEETDATA: Stroom per fase (A) – FP32 ----------------------------
+
+      - address: 0xF4  # CT1 / L1 stroom (A)
+        value_type: FP32
+        read_lambda: |-
+          if (!id(p1_available) ||
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL)
+            return 0.0f;
+          return id(current_l1_a);
+
+      - address: 0xF6  # CT2 / L2 stroom (A)
+        value_type: FP32
+        read_lambda: |-
+          if (!id(p1_available) ||
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL)
+            return 0.0f;
+          return (${grid_phases} >= 2) ? id(current_l2_a) : 0.0f;
+
+      - address: 0xF8  # CT3 / L3 stroom (A)
+        value_type: FP32
+        read_lambda: |-
+          if (!id(p1_available) ||
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL)
+            return 0.0f;
+          return (${grid_phases} >= 3) ? id(current_l3_a) : 0.0f;
+
+      - address: 0xFA  # CT4 – altijd 0
+        value_type: FP32
+        read_lambda: 'return 0.0f;'
+
+      - address: 0xFC  # Totaal stroom (A) = L1 + L2 + L3
+        value_type: FP32
+        read_lambda: |-
+          if (!id(p1_available) ||
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL)
+            return 0.0f;
+          float total = id(current_l1_a);
+          if (${grid_phases} >= 2) total += id(current_l2_a);
+          if (${grid_phases} >= 3) total += id(current_l3_a);
+          return total;
+
+# --- Globale variabelen -------------------------------------------------------
+globals:
+  - id: p1_ip_address
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  - id: power_l1_w
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: power_l2_w
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: power_l3_w
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: current_l1_a
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: current_l2_a
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: current_l3_a
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: total_power_w
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: http_fail_count
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: p1_available
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Tijdstempel van de laatste succesvolle P1-poll (millis())
+  - id: last_p1_update
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  # Tijdstempel van de laatste mDNS-discovery poging (millis())
+  # Zorgt dat de blokkerende mdns_query_ptr() max 1x per mdns_retry_interval_s
+  # wordt aangeroepen, niet elke poll-seconde.
+  - id: last_mdns_attempt
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+# --- HTTP client voor P1 API polling ------------------------------------------
+http_request:
+  useragent: "ESPHome HomeWizard Neurio Emulator"
+  timeout: 2s
+  verify_ssl: false
+  buffer_size_rx: 2048
+  buffer_size_tx: 512
+
+# --- Interval: stale-data detectie + mDNS-discovery + P1-polling -------------
+#
+# Alles draait in één interval van poll_interval_s seconden:
+#   1. Stale-data check: reset p1_available als data te oud is
+#   2. mDNS-discovery: zoek P1 meter als IP onbekend (max 1x per retry-interval)
+#      → mdns_query_ptr() blokkeert max 800ms; Modbus is interrupt-driven en
+#        mist geen frames tijdens deze korte pauze in de main-loop.
+#      → Bij fout: last_mdns_attempt = 0 zodat de volgende poging direct start.
+#   3. HTTP-poll: haal P1-data op als IP bekend is
+# -----------------------------------------------------------------------------
+interval:
+  - interval: ${poll_interval_s}s
+    then:
+
+      # STAP 1: Stale-data detectie
+      - lambda: |-
+          if (id(p1_available) &&
+              id(last_p1_update) > 0 &&
+              (millis() - id(last_p1_update)) > ${stale_data_timeout_ms}UL) {
+            ESP_LOGW("p1poll",
+              "P1-data ouder dan %dms – p1_available gereset.",
+              ${stale_data_timeout_ms});
+            id(p1_available) = false;
+            id(p1_status_sensor).publish_state("Stale – wacht op verse data");
+          }
+
+      # STAP 2: mDNS-discovery (alleen als IP onbekend en interval verstreken)
+      - if:
+          condition:
+            lambda: |-
+              return id(p1_ip_address).empty() &&
+                     (millis() - id(last_mdns_attempt)) >=
+                       (${mdns_retry_interval_s} * 1000UL);
+          then:
+            - lambda: |-
+                id(last_mdns_attempt) = millis();
+                ESP_LOGI("mdns", "mDNS discovery: zoek _hwenergy._tcp ...");
+
+                if (!network::is_connected()) {
+                  ESP_LOGW("mdns", "Netwerk niet verbonden – discovery overgeslagen.");
+                  return;
+                }
+
+                mdns_result_t *results = nullptr;
+                esp_err_t err = mdns_query_ptr(
+                  "_hwenergy", "_tcp",
+                  800,  // max 800ms blokkering
+                  5,
+                  &results
+                );
+
+                if (err != ESP_OK || results == nullptr) {
+                  ESP_LOGW("mdns",
+                    "Geen _hwenergy._tcp gevonden (err=%s). Volgende poging over %ds.",
+                    esp_err_to_name(err), ${mdns_retry_interval_s});
+                  if (results) mdns_query_results_free(results);
+                  return;
+                }
+
+                const char *found_hostname = nullptr;
+                mdns_result_t *r = results;
+                while (r != nullptr) {
+                  for (int i = 0; i < (int)r->txt_count; i++) {
+                    if (r->txt[i].key   != nullptr &&
+                        strcmp(r->txt[i].key,   "product_type") == 0 &&
+                        r->txt[i].value != nullptr &&
+                        strcmp(r->txt[i].value, "HWE-P1") == 0) {
+                      found_hostname = r->hostname;
+                      ESP_LOGI("mdns", "HomeWizard P1 gevonden: %s.local",
+                               found_hostname ? found_hostname : "(onbekend)");
+                      break;
+                    }
+                  }
+                  if (found_hostname) break;
+                  r = r->next;
+                }
+
+                if (!found_hostname) {
+                  ESP_LOGW("mdns", "_hwenergy._tcp gevonden maar geen HWE-P1.");
+                  mdns_query_results_free(results);
+                  return;
+                }
+
+                // IP-adres opmaken zonder IPSTR/IP2STR macros (vermijdt esp_netif.h include).
+                // ESP_IPADDR_TYPE_V4 = 0
+                char ip_buf[16] = {0};
+                if (r->addr != nullptr &&
+                    r->addr->addr.type == 0 /* ESP_IPADDR_TYPE_V4 */) {
+                  uint32_t ip = r->addr->addr.u_addr.ip4.addr;
+                  snprintf(ip_buf, sizeof(ip_buf), "%d.%d.%d.%d",
+                    (int)(ip & 0xFF), (int)((ip >> 8) & 0xFF),
+                    (int)((ip >> 16) & 0xFF), (int)((ip >> 24) & 0xFF));
+                } else {
+                  // A-record query als geen IPv4 in PTR-resultaat
+                  // esp_ip4_addr_t is een simpele struct met uint32_t addr
+                  esp_ip4_addr_t addr4 = {0};
+                  esp_err_t a_err = mdns_query_a(found_hostname, 2048, &addr4);
+                  if (a_err == ESP_OK) {
+                    snprintf(ip_buf, sizeof(ip_buf), "%d.%d.%d.%d",
+                      (int)(addr4.addr & 0xFF), (int)((addr4.addr >> 8) & 0xFF),
+                      (int)((addr4.addr >> 16) & 0xFF), (int)((addr4.addr >> 24) & 0xFF));
+                  } else {
+                    ESP_LOGW("mdns", "A-record query voor %s.local mislukt (%s).",
+                             found_hostname, esp_err_to_name(a_err));
+                    mdns_query_results_free(results);
+                    return;
+                  }
+                }
+
+                mdns_query_results_free(results);
+
+                id(p1_ip_address)   = std::string(ip_buf);
+                id(http_fail_count) = 0;
+                ESP_LOGI("mdns", "P1 meter IP gecachet: %s", ip_buf);
+                id(p1_ip_sensor).publish_state(std::string(ip_buf));
+                id(p1_status_sensor).publish_state(
+                  std::string("Verbinden... (") + ip_buf + ")");
+
+      # STAP 3: HTTP-polling (alleen als IP bekend is)
+      - if:
+          condition:
+            lambda: 'return !id(p1_ip_address).empty();'
+          then:
+            - http_request.get:
+                url: !lambda |-
+                  return "http://" + id(p1_ip_address) + "/api/v1/data";
+                capture_response: true
+                max_response_buffer_size: 2048
+                on_response:
+                  then:
+                    - lambda: |-
+                        if (response->status_code != 200) {
+                          ESP_LOGW("p1poll",
+                            "HTTP %d van %s – cache wissen.",
+                            response->status_code, id(p1_ip_address).c_str());
+                          id(p1_ip_address)     = "";
+                          id(http_fail_count)  += 1;
+                          id(p1_available)      = false;
+                          id(last_mdns_attempt) = 0;  // direct herstart discovery
+
+                          id(p1_ip_sensor).publish_state("Onbekend");
+                          id(p1_status_sensor).publish_state(
+                            std::string("Offline – zoek HWE-P1 (fouten: ") +
+                            std::to_string(id(http_fail_count)) + ")");
+
+                          if (id(http_fail_count) >= ${max_http_fails}) {
+                            ESP_LOGE("p1poll",
+                              "%d fouten – wacht %dms, dan herstart.",
+                              id(http_fail_count), ${reboot_backoff_ms});
+                            id(p1_status_sensor).publish_state(
+                              std::string("Kritiek: herstart over ") +
+                              std::to_string(${reboot_backoff_ms} / 1000) + "s");
+                            vTaskDelay(pdMS_TO_TICKS(${reboot_backoff_ms}));
+                            App.safe_reboot();
+                          }
+                          return;
+                        }
+
+                        id(http_fail_count) = 0;
+
+                        // Robuuste JSON float-parser (ondersteunt e-notatie)
+                        auto extract_float = [](const std::string& json,
+                                                const std::string& key) -> float {
+                          std::string search = "\"" + key + "\":";
+                          size_t pos = json.find(search);
+                          if (pos == std::string::npos) return 0.0f;
+                          pos += search.length();
+                          while (pos < json.size() && json[pos] == ' ') pos++;
+                          size_t end = pos;
+                          if (end < json.size() && json[end] == '-') end++;
+                          while (end < json.size() &&
+                                 (isdigit((unsigned char)json[end]) ||
+                                  json[end] == '.' ||
+                                  json[end] == 'e' || json[end] == 'E' ||
+                                  json[end] == '+'))
+                            end++;
+                          if (end == pos) return 0.0f;
+                          std::string num = json.substr(pos, end - pos);
+                          char *endptr = nullptr;
+                          float val = strtof(num.c_str(), &endptr);
+                          return (endptr != num.c_str()) ? val : 0.0f;
+                        };
+
+                        float p_total = extract_float(body, "active_power_w");
+                        float p_l1    = extract_float(body, "active_power_l1_w");
+                        float p_l2    = extract_float(body, "active_power_l2_w");
+                        float p_l3    = extract_float(body, "active_power_l3_w");
+                        float i_l1    = extract_float(body, "active_current_l1_a");
+                        float i_l2    = extract_float(body, "active_current_l2_a");
+                        float i_l3    = extract_float(body, "active_current_l3_a");
+
+                        const float V = static_cast<float>(${grid_voltage});
+
+                        // Bereken stroom uit vermogen voor DSMR v4 meters
+                        if (i_l1 == 0.0f && fabsf(p_l1) > 1.0f) i_l1 = p_l1 / V;
+                        if (i_l2 == 0.0f && fabsf(p_l2) > 1.0f) i_l2 = p_l2 / V;
+                        if (i_l3 == 0.0f && fabsf(p_l3) > 1.0f) i_l3 = p_l3 / V;
+
+                        // Ongebruikte fasen op 0
+                        if (${grid_phases} < 2) { p_l2 = 0.0f; i_l2 = 0.0f; }
+                        if (${grid_phases} < 3) { p_l3 = 0.0f; i_l3 = 0.0f; }
+
+                        id(power_l1_w)     = p_l1;
+                        id(power_l2_w)     = p_l2;
+                        id(power_l3_w)     = p_l3;
+                        id(total_power_w)  = p_total;
+                        id(current_l1_a)   = i_l1;
+                        id(current_l2_a)   = i_l2;
+                        id(current_l3_a)   = i_l3;
+                        id(last_p1_update) = millis();
+
+                        ESP_LOGI("p1poll",
+                          "P1: totaal=%.0fW  L1=%.0fW/%.2fA  L2=%.0fW/%.2fA  L3=%.0fW/%.2fA",
+                          p_total, p_l1, i_l1, p_l2, i_l2, p_l3, i_l3);
+
+                        id(sensor_power_l1).publish_state(p_l1);
+                        id(sensor_power_l2).publish_state(p_l2);
+                        id(sensor_power_l3).publish_state(p_l3);
+                        id(sensor_power_total).publish_state(p_total);
+                        id(sensor_current_l1).publish_state(i_l1);
+                        id(sensor_current_l2).publish_state(i_l2);
+                        id(sensor_current_l3).publish_state(i_l3);
+
+                        if (!id(p1_available)) {
+                          id(p1_available) = true;
+                          id(p1_status_sensor).publish_state(
+                            std::string("Online (") + id(p1_ip_address) + ")");
+                          ESP_LOGI("p1poll",
+                            "Eerste P1 data – Modbus registers actief.");
+                        }
+
+                on_error:
+                  then:
+                    - lambda: |-
+                        ESP_LOGW("p1poll",
+                          "TCP-fout (IP: %s) – cache wissen.",
+                          id(p1_ip_address).c_str());
+
+                        id(p1_ip_address)     = "";
+                        id(http_fail_count)  += 1;
+                        id(p1_available)      = false;
+                        id(last_mdns_attempt) = 0;  // direct herstart discovery
+
+                        id(p1_ip_sensor).publish_state("Onbekend (verbindingsfout)");
+                        id(p1_status_sensor).publish_state(
+                          std::string("Offline – zoek HWE-P1 (fouten: ") +
+                          std::to_string(id(http_fail_count)) + ")");
+
+                        if (id(http_fail_count) >= ${max_http_fails}) {
+                          ESP_LOGE("p1poll",
+                            "%d fouten – wacht %dms, dan herstart.",
+                            id(http_fail_count), ${reboot_backoff_ms});
+                          id(p1_status_sensor).publish_state(
+                            std::string("Kritiek: herstart over ") +
+                            std::to_string(${reboot_backoff_ms} / 1000) + "s");
+                          vTaskDelay(pdMS_TO_TICKS(${reboot_backoff_ms}));
+                          App.safe_reboot();
+                        }
+
+# --- Text sensors -------------------------------------------------------------
+text_sensor:
+  - platform: template
+    id: p1_ip_sensor
+    name: "P1 Meter IP-adres"
+    entity_category: diagnostic
+    icon: "mdi:ip-network"
+
+  - platform: template
+    id: p1_status_sensor
+    name: "P1 Meter Status"
+    entity_category: diagnostic
+    icon: "mdi:meter-electric"
+
+# --- Sensors ------------------------------------------------------------------
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signaal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    entity_category: diagnostic
+
+  - platform: template
+    id: sensor_power_l1
+    name: "Vermogen L1"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+#    icon: "mdi:flash"
+    internal: True
+
+  - platform: template
+    id: sensor_power_l2
+    name: "Vermogen L2"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+#    icon: "mdi:flash"
+    internal: True
+
+  - platform: template
+    id: sensor_power_l3
+    name: "Vermogen L3"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+#    icon: "mdi:flash"
+    internal: True
+
+  - platform: template
+    id: sensor_power_total
+    name: "Totaal Vermogen"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  #  icon: "mdi:transmission-tower"
+    internal: True
+
+  - platform: template
+    id: sensor_current_l1
+    name: "Stroom L1"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:current-ac"
+
+  - platform: template
+    id: sensor_current_l2
+    name: "Stroom L2"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:current-ac"
+
+  - platform: template
+    id: sensor_current_l3
+    name: "Stroom L3"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: "mdi:current-ac"
+
+# --- Restart knop -------------------------------------------------------------
+button:
+  - platform: restart
+    name: "Herstart"
+    entity_category: config
