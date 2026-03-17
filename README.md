@@ -2,20 +2,21 @@ Based on info from https://github.com/dracoventions/TWCManager/issues/20 I made,
 Claude's work still needed a lot of attention. In the end, it took me about 25 iterations before I manually resolved the rest.
 
 **Hardware**
-For this I used the following hardware:<br>
+For this I used the following hardware.
+<br>
+esp32-s3-devkitc-1 n16r8: https://nl.aliexpress.com/item/1005010579778226.html:<br>
 <img width="480" height="240" alt="{9107FE65-E2D5-4174-AE9B-F978A917C16E}" src="https://github.com/user-attachments/assets/78b1314c-f4e0-42f7-877b-2e34ff23b726" />
 <br>
-esp32-s3-devkitc-1 n16r8: https://nl.aliexpress.com/item/1005010579778226.html and
+and RS485 to serieel module: https://nl.aliexpress.com/item/1005010275911984.html
 <br>
-<img width="519" height="410" alt="{9B683857-5FE6-4D31-86F9-13EAB3377254}" src="https://github.com/user-attachments/assets/ab034022-030b-43f1-b84c-b84da177bc3f" />
+<img width="300" alt="image" src="https://github.com/user-attachments/assets/94435ba4-6df5-4a8b-9d68-757d4b56828d" />
+
 <br>
-RS485 to serieel module: https://nl.aliexpress.com/item/1005010275911984.html 
-but knowing what I know now, I would have ordered
-<br>
+ 
+but knowing what I know now, I would have ordered this module: https://nl.aliexpress.com/item/1005008635626105.html
 <br>
 <img width="466" height="336" alt="{C95F06F8-0D7F-46F4-A6FD-95BD7A950317}" src="https://github.com/user-attachments/assets/3328a0d6-b0c9-42fd-b15c-04bf20ebdb39" />
-<br> this module: https://nl.aliexpress.com/item/1005008635626105.html
-<br>
+<br> 
 <br>
 This is what it looks like after the parts have been soldered together:
 <br>
